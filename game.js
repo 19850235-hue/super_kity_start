@@ -80,9 +80,9 @@ const WORLD_ENEMIES = [
 
 // Adornos de plataforma propios de cada mundo
 const THEME_PROPS = {
-    garden: ['flower', 'tulip', 'flower', 'bush', 'picket', 'applekitty', 'mushroom'],
-    golden: ['wheat', 'haystack', 'pumpkin', 'rock', 'wheat', 'goldpot'],
-    night: ['candycane', 'lollipop', 'gumdrop', 'cupcake', 'banner', 'candycane']
+    garden: ['rose', 'rose', 'rosebush', 'tulip', 'picket', 'rose', 'flower', 'applekitty'],
+    golden: ['oreRock', 'crystal', 'goldpot', 'minecart', 'rock', 'cactus', 'oreRock', 'wheat'],
+    night: ['candycane', 'lollipop', 'cupcake', 'donut', 'icecream', 'gumdrop', 'banner', 'cupcake']
 };
 
 // Power-ups temporales
@@ -1053,11 +1053,25 @@ function startLevel(worldIdx, levelIdx) {
 
     // MONEDAS: arcos sobre cada hueco y filas en las plataformas anchas (+50 puntos; todas = bonus y estrella extra)
     const coinProto = Render3D.createCoinMesh();
-    function addCoin(x, y) {
+    // Zona que recorre cada plataforma móvil: una moneda fija ahí dentro quedaría tapada o atrapada en la plataforma
+    function coinBlockedByMoving(x, y) {
+        return solidPlatforms.some(sp => {
+            const mp = sp.mp;
+            if (!mp) return false;
+            const rx = mp.vertical ? 0 : mp.range, ry = mp.vertical ? mp.range : 0;
+            return Math.abs(x - mp.baseX) < mp.w / 2 + rx + 1 && Math.abs(y - mp.baseY) < 0.7 + ry + 1.2;
+        });
+    }
+    // mp (opcional): la moneda va montada sobre esa plataforma móvil y se mueve con ella
+    function addCoin(x, y, mp) {
+        if (!mp && coinBlockedByMoving(x, y)) return;
         const m = coinProto.clone();
         m.position.set(x, y, 0);
         scene.add(m);
-        coins.push({ mesh: m, active: true, baseY: y, phase: Math.random() * 6.28 });
+        coins.push({
+            mesh: m, active: true, baseY: y, phase: Math.random() * 6.28,
+            mp: mp || null, offX: mp ? x - mp.baseX : 0, offY: mp ? y - mp.baseY : 0
+        });
     }
     for (let i = 0; i < layout.length - 1; i++) {
         const a = layout[i], b = layout[i + 1];
@@ -1069,7 +1083,7 @@ function startLevel(worldIdx, levelIdx) {
         }
     }
     layout.forEach((p, i) => {
-        if (i > 0 && i < layout.length - 1 && p.w > 10) [-2.4, -1.2, 1.2, 2.4].forEach(dx => addCoin(p.x + dx, p.y + 2.2));
+        if (i > 0 && i < layout.length - 1 && p.w > 10) [-2.4, -1.2, 1.2, 2.4].forEach(dx => addCoin(p.x + dx, p.y + 2.2, solidPlatforms[i] && solidPlatforms[i].mp));
     });
     coinsTotal = coins.length;
 
@@ -1741,11 +1755,13 @@ function startLevel(worldIdx, levelIdx) {
                 Render3D.updatePlayerSpriteAnim(playerMesh, facingRight ? 'right' : 'left', 0, isAirborne);
             }
         } else {
-            enemies.concat(flyingEnemies).forEach(e => {
+            const _nearCheck = (e) => {
                 if (e.active && playerMesh.position.distanceTo(e.mesh.position) < 2.0) {
                     removeEnemy(e);
                 }
-            });
+            };
+            enemies.forEach(_nearCheck);
+            flyingEnemies.forEach(_nearCheck);
         }
 
         // Los saltos se recuperan solo al estar realmente sobre una plataforma. Si el jugador se cae de un
@@ -2038,8 +2054,16 @@ function startLevel(worldIdx, levelIdx) {
         coins.forEach(c => {
             if (!c.active) return;
             c.mesh.rotation.y += delta * 3;
-            if (effects.magnet > 0) { attract(c.mesh); c.baseY = c.mesh.position.y; }
-            else c.mesh.position.y = c.baseY + Math.sin(gameTime * 3 + c.phase) * 0.15;
+            if (effects.magnet > 0) {
+                c.mp = null; // con el imán la moneda se suelta de la plataforma
+                attract(c.mesh); c.baseY = c.mesh.position.y;
+            } else {
+                if (c.mp) { // montada en una plataforma móvil: la acompaña
+                    c.mesh.position.x = c.mp.lastX + c.offX;
+                    c.baseY = c.mp.lastY + c.offY;
+                }
+                c.mesh.position.y = c.baseY + Math.sin(gameTime * 3 + c.phase) * 0.15;
+            }
             if (playerMesh.position.distanceTo(c.mesh.position) < 1.15) {
                 c.active = false;
                 scene.remove(c.mesh);
@@ -2184,6 +2208,7 @@ function startLevel(worldIdx, levelIdx) {
             if (b.life <= 0) { scene.remove(b.mesh); bullets.splice(idx, 1); }
         }
 
+        const _nowMs = Date.now(); // una sola lectura por cuadro para lava y fondo
         // Animación de lava: brasas subiendo y llamas titilando
         hazards.forEach(hz => {
             if (hz.isLava && hz.mesh) {
@@ -2192,7 +2217,7 @@ function startLevel(worldIdx, levelIdx) {
                         child.position.y += delta * 0.6;
                         if (child.position.y > 1.1) child.position.y = 0.4;
                     } else if (child.name === 'lavaFlame') {
-                        child.scale.y = 0.85 + Math.abs(Math.sin(Date.now() * 0.006 + child.position.x)) * 0.3;
+                        child.scale.y = 0.85 + Math.abs(Math.sin(_nowMs * 0.006 + child.position.x)) * 0.3;
                     }
                 });
             }
@@ -2303,6 +2328,18 @@ function startLevel(worldIdx, levelIdx) {
         // Fondo animado
         if (bgDecor) bgDecor.children.forEach(c => {
           try {
+            if (c.userData && c.userData.rise) { // corazones, pétalos y chispas que suben flotando
+                const u = c.userData;
+                c.position.y += u.rise * delta;
+                c.position.x = u.baseX + Math.sin(gameTime * u.sway + u.ph) * u.amp;
+                c.rotation.y += delta * 1.5;
+                if (c.position.y > u.maxY) c.position.y = u.minY;
+                return;
+            }
+            if (c.userData && c.userData.spinners) { // ruedas de las minas
+                c.userData.spinners.forEach(sp => { sp.o.rotation[sp.axis] += sp.speed * delta; });
+                return;
+            }
             if (c.userData && c.userData.isWindmill) {
                 const bl = c.getObjectByName('blades');
                 if (bl) bl.rotation.z -= delta * 1.1;
@@ -2312,40 +2349,40 @@ function startLevel(worldIdx, levelIdx) {
             if (c.userData && c.userData.isStaticDecor) return;
             if (c.userData && c.userData.isSnowflake) {
                 c.position.y -= delta * c.userData.fallSpeed;
-                c.position.x += Math.sin(Date.now() * 0.001 + c.userData.driftOffset) * delta * 0.4;
+                c.position.x += Math.sin(_nowMs * 0.001 + c.userData.driftOffset) * delta * 0.4;
                 if (c.position.y < -3) c.position.y = c.userData.baseY;
                 return;
             }
             if (c.userData && c.userData.isTwinkleStar) {
                 const mat = c.material;
-                if (mat) mat.opacity = 0.4 + Math.abs(Math.sin(Date.now() * 0.002 + c.userData.twinkleOffset)) * 0.6;
+                if (mat) mat.opacity = 0.4 + Math.abs(Math.sin(_nowMs * 0.002 + c.userData.twinkleOffset)) * 0.6;
                 if (mat) mat.transparent = true;
                 return;
             }
             if (c.userData && (c.userData.isButterfly || c.userData.isBird)) {
-                const t = Date.now() * 0.001 * c.userData.roamSpeed + c.userData.roamOffset;
+                const t = _nowMs * 0.001 * c.userData.roamSpeed + c.userData.roamOffset;
                 c.position.x = (c.userData.baseX ?? c.position.x) + Math.sin(t) * 4;
                 c.position.y = c.userData.baseY + Math.sin(t * 1.7) * 1.2;
                 c.rotation.y = Math.cos(t) > 0 ? 0 : Math.PI;
                 const wingL = c.getObjectByName('wingL');
                 const wingR = c.getObjectByName('wingR');
-                const flap = Math.sin(Date.now() * 0.001 * c.userData.flapSpeed) * 0.9;
+                const flap = Math.sin(_nowMs * 0.001 * c.userData.flapSpeed) * 0.9;
                 if (wingL) wingL.rotation.z = flap;
                 if (wingR) wingR.rotation.z = -flap;
                 return;
             }
             if (c.userData && c.userData.isFirefly) {
-                const t = Date.now() * 0.001 * c.userData.roamSpeed + c.userData.roamOffset;
+                const t = _nowMs * 0.001 * c.userData.roamSpeed + c.userData.roamOffset;
                 c.position.x = (c.userData.baseX ?? c.position.x) + Math.sin(t) * 2.2;
                 c.position.y = c.userData.baseY + Math.sin(t * 1.4) * 0.9 + Math.cos(t * 0.6) * 0.4;
-                const pulse = 0.6 + Math.abs(Math.sin(Date.now() * 0.004 + c.userData.roamOffset)) * 0.4;
+                const pulse = 0.6 + Math.abs(Math.sin(_nowMs * 0.004 + c.userData.roamOffset)) * 0.4;
                 c.scale.set(pulse, pulse, pulse);
                 return;
             }
             if (c.userData && c.userData.isMagicTree) {
                 const glow = c.getObjectByName('magicGlow');
                 const halo = c.getObjectByName('magicHalo');
-                const pulse = 0.7 + Math.abs(Math.sin(Date.now() * 0.003 + c.userData.twinkleOffset)) * 0.5;
+                const pulse = 0.7 + Math.abs(Math.sin(_nowMs * 0.003 + c.userData.twinkleOffset)) * 0.5;
                 if (glow) glow.scale.set(pulse, pulse, pulse);
                 if (halo) halo.scale.set(pulse * 1.1, pulse * 1.1, pulse * 1.1);
                 return;
@@ -2353,7 +2390,7 @@ function startLevel(worldIdx, levelIdx) {
             c.rotation.y += delta * 0.15;
             if (c.userData && c.userData.isFloatDecor) {
                 c.rotation.y += delta * 0.6;
-                c.position.y = c.userData.baseY + Math.sin(Date.now() * 0.001 * c.userData.floatSpeed + c.userData.floatOffset) * c.userData.floatAmp;
+                c.position.y = c.userData.baseY + Math.sin(_nowMs * 0.001 * c.userData.floatSpeed + c.userData.floatOffset) * c.userData.floatAmp;
             }
           } catch (decorErr) {
             // Una pieza decorativa rota ya no tumba el resto del fondo animado.

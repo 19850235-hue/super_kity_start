@@ -1254,8 +1254,8 @@ const Render3D = {
         group.userData.theme = theme;
 
         const THEMES = {
-            garden: { hill1: 0x9ad77a, hill2: 0xf8a5c2, sun: 0xfff59d, sunGlow: 0xffb3d1, tree: 0xff9ec7, cloud: 0xffffff },
-            golden: { hill1: 0xf2c14e, hill2: 0xe39a2e, sun: 0xfff3c4, sunGlow: 0xffd54f, tree: 0xffca28, cloud: 0xfff3e0 },
+            garden: { hill1: 0xc9ecc4, hill2: 0xfbc9dd, sun: 0xfff1b8, sunGlow: 0xffc8de, tree: 0xffb7d5, cloud: 0xffffff },
+            golden: { hill1: 0xf6d58a, hill2: 0xe8ac4a, sun: 0xfff3c4, sunGlow: 0xffd54f, tree: 0xffca28, cloud: 0xfff3e0 },
             night: { hill1: 0x4a148c, hill2: 0x2a1454, sun: 0xe1f5fe, sunGlow: 0x7e57c2, tree: 0x7e57c2, cloud: 0xd1c4e9 }
         };
         const th = THEMES[theme] || THEMES.garden;
@@ -1992,10 +1992,116 @@ const Render3D = {
         return g;
     };
     const origProp = Render3D.createProp;
-    Render3D.createProp = (type) => Render3D.createThemeProp(type) || origProp(type);
+    // Adornos de plataforma que reutilizan los modelos del decorado (se escalan para que midan lo de un adorno normal
+    // y se apoyan con su base exactamente en y = 0)
+    const PROP_BUILDERS = {
+        rose: () => {
+            const g = new THREE.Group();
+            const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.05, 0.8, 6), CM(0x7bc47f));
+            stem.position.y = 0.4; g.add(stem);
+            [-1, 1].forEach(s => {
+                const leaf = new THREE.Mesh(new THREE.SphereGeometry(0.15, 8, 6), CM(0x9ddca7, { roughness: 0.8 }));
+                leaf.scale.set(1.6, 0.35, 0.8); leaf.position.set(s * 0.17, 0.35, 0); leaf.rotation.z = s * 0.4; g.add(leaf);
+            });
+            const bloom = makeRose(pick(ROSE_COLORS), 0.4);
+            bloom.position.y = 0.78; g.add(bloom);
+            return g;
+        },
+        rosebush: () => { const g = makeRoseBush(); g.scale.setScalar(0.5); return g; },
+        oreRock:  () => { const g = makeOreRock(); g.scale.setScalar(0.6); return g; },
+        crystal:  () => { const g = makeCrystalCluster(pick([0xffb300, 0xffa000, 0x4dd0e1])); g.scale.setScalar(0.34); return g; },
+        minecart: () => { const g = makeMineCart(); g.scale.setScalar(0.85); return g; },
+        cactus:   () => { const g = makeCactus(); g.scale.setScalar(0.45); return g; },
+        donut:    () => { const g = makeDonut(); g.scale.setScalar(0.3); return g; },
+        icecream: () => { const g = makeIceCreamTree(); g.scale.setScalar(0.3); return g; }
+    };
+    Render3D.createProp = (type) => {
+        const build = PROP_BUILDERS[type];
+        if (build) {
+            const inner = build();
+            const wrap = new THREE.Group();
+            wrap.add(inner);
+            wrap.updateMatrixWorld(true);
+            const box = new THREE.Box3().setFromObject(wrap);
+            inner.position.y -= box.min.y; // la base queda apoyada en la plataforma
+            return wrap;
+        }
+        return Render3D.createThemeProp(type) || origProp(type);
+    };
 
     // ---------- FONDOS ----------
-    Render3D.createBackgroundDecor = (scene, levelWidth, theme = 'garden') => {
+    // El fondo tiene miles de piezas pequeñas. Las que no se mueven nunca se funden en pocas mallas grandes
+    // (agrupadas por material y por tramo de 70 unidades del nivel, para que el motor siga descartando lo que no se ve).
+    // Se ven exactamente igual, pero se dibujan con muchas menos llamadas. Quedan fuera las piezas animadas
+    // (molinos, ruedas, rayos de sol), las transparentes y las que usan texturas.
+    function mergeStaticDecor(g) {
+        g.updateMatrixWorld(true);
+        const CHUNK = 70;
+        const buckets = new Map();
+        const detach = [];
+        const canMerge = (o) => {
+            const m = o.material;
+            return o.isMesh && !o.isInstancedMesh && m && !Array.isArray(m) && !m.map && !m.vertexColors && !m.transparent
+                && !(m.opacity !== undefined && m.opacity < 1) && o.matrixWorld.determinant() > 0;
+        };
+        g.children.forEach(c => {
+            const u = c.userData || {};
+            if (!u.isStaticDecor || u.spinners || u.isWindmill || u.isSunRays || u.rise || u.isMagicTree) return;
+            let animated = false;
+            c.traverse(o => {
+                const ou = o.userData || {};
+                if (o.name === 'blades' || ou.rise || ou.spinners) animated = true;
+            });
+            if (animated) return;
+            const chunk = Math.floor(c.position.x / CHUNK);
+            // Se funden las piezas opacas; las transparentes (cristales, brillos...) se quedan donde están
+            c.traverse(o => {
+                if (!canMerge(o)) return;
+                const m = o.material;
+                const key = [chunk, m.type, m.color.getHex(), m.roughness, m.metalness, m.emissive ? m.emissive.getHex() : 0,
+                    m.emissiveIntensity, m.side, m.flatShading ? 1 : 0].join('|');
+                if (!buckets.has(key)) buckets.set(key, { mat: m, items: [] });
+                buckets.get(key).items.push(o);
+                detach.push(o);
+            });
+        });
+        buckets.forEach(({ mat, items }) => {
+            let vCount = 0, iCount = 0;
+            const geos = items.map(o => {
+                const geo = o.geometry.clone();
+                geo.applyMatrix4(o.matrixWorld);
+                vCount += geo.attributes.position.count;
+                iCount += geo.index ? geo.index.count : geo.attributes.position.count;
+                return geo;
+            });
+            const pos = new Float32Array(vCount * 3), nor = new Float32Array(vCount * 3), idx = new Uint32Array(iCount);
+            let vo = 0, io = 0;
+            geos.forEach(geo => {
+                const p = geo.attributes.position, n = geo.attributes.normal;
+                pos.set(p.array, vo * 3);
+                if (n) nor.set(n.array, vo * 3);
+                if (geo.index) { for (let k = 0; k < geo.index.count; k++) idx[io + k] = geo.index.array[k] + vo; io += geo.index.count; }
+                else { for (let k = 0; k < p.count; k++) idx[io + k] = vo + k; io += p.count; }
+                vo += p.count;
+                geo.dispose();
+            });
+            const out = new THREE.BufferGeometry();
+            out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            out.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+            out.setIndex(new THREE.BufferAttribute(idx, 1));
+            const mesh = new THREE.Mesh(out, mat);
+            mesh.userData.isStaticDecor = true;
+            mesh.matrixAutoUpdate = false;
+            g.add(mesh);
+        });
+        detach.forEach(o => { if (o.parent) o.parent.remove(o); });
+        return g;
+    }
+    Render3D._mergeStaticDecor = mergeStaticDecor; // expuesta para poder verificarla
+    Render3D.createBackgroundDecor = (scene, levelWidth, theme = 'garden') =>
+        mergeStaticDecor(Render3D._buildBackgroundDecor(scene, levelWidth, theme));
+
+    Render3D._buildBackgroundDecor = (scene, levelWidth, theme = 'garden') => {
         if (theme === 'golden') {
             const g = Render3D._createDecorBase(scene, levelWidth, 'golden', { trees: false, forest: false, mushrooms: false });
             addGoldenExtras(g, levelWidth);
@@ -2029,48 +2135,222 @@ const Render3D = {
         group.add(a, b);
     }
 
+    // ---------- Utilidades de decorado ----------
+    const _mc = {};
+    function CM(color, extra) { // materiales compartidos (menos memoria con cientos de adornos)
+        const key = color + '|' + JSON.stringify(extra || {});
+        if (!_mc[key]) _mc[key] = new THREE.MeshStandardMaterial(Object.assign({ color, roughness: 0.6 }, extra || {}));
+        return _mc[key];
+    }
+    function beam(a, b, r, mat) { // cilindro entre dos puntos (vigas, patas...)
+        const dir = new THREE.Vector3().subVectors(b, a);
+        const len = dir.length();
+        const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, 6), mat);
+        m.position.copy(a).addScaledVector(dir, 0.5);
+        m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+        return m;
+    }
+    // Adornos que suben flotando (corazones, pétalos, chispas): los anima el bucle del juego (userData.rise)
+    function addRising(group, W, count, makeFn, minY, maxY, speed) {
+        for (let i = 0; i < count; i++) {
+            const m = makeFn();
+            const x = rnd(-10, W + 10);
+            m.position.set(x, rnd(minY, maxY), rnd(-14, 6));
+            m.userData = { rise: speed * rnd(0.7, 1.3), baseX: x, minY, maxY, sway: rnd(0.6, 1.4), ph: rnd(0, 6.28), amp: rnd(0.4, 1.2) };
+            group.add(m);
+        }
+    }
+
+    // =========================================================
+    // JARDÍN ROSA — rosas, tonos pastel suaves y dulces
+    // =========================================================
+    const SHELL = new THREE.SphereGeometry(1, 14, 8, 0, Math.PI * 2, 0, Math.PI * 0.5);
+    const ROSE_COLORS = [0xffc2d9, 0xffd1dc, 0xffb3cf, 0xe9d3ff, 0xfff0e6, 0xffcfb8, 0xffe0ec];
+    const LEAF_COLORS = [0x9ddca7, 0xb5e6b0, 0x8fd49a];
+    function makeRose(color, size) {
+        const g = new THREE.Group();
+        const c2 = new THREE.Color(color).multiplyScalar(0.88).getHex();
+        const mats = [
+            CM(color, { side: THREE.DoubleSide, roughness: 0.55, emissive: color, emissiveIntensity: 0.18 }),
+            CM(c2, { side: THREE.DoubleSide, roughness: 0.55, emissive: c2, emissiveIntensity: 0.12 })
+        ];
+        [[1.0, 0.0, 0.75], [0.82, 0.12, 0.9], [0.64, 0.24, 1.0], [0.46, 0.34, 1.1], [0.28, 0.42, 1.2]].forEach(([s, y, h], i) => {
+            const sh = new THREE.Mesh(SHELL, mats[i % 2]);
+            sh.rotation.x = Math.PI; sh.rotation.y = i * 1.1;
+            sh.scale.set(s * size, s * size * h * 0.7, s * size);
+            sh.position.y = y * size;
+            g.add(sh);
+        });
+        const bud = new THREE.Mesh(new THREE.SphereGeometry(0.2 * size, 8, 8), mats[1]);
+        bud.position.y = 0.3 * size; g.add(bud);
+        return g;
+    }
+    function makeRoseBush() {
+        const g = new THREE.Group();
+        const leaf = CM(pick(LEAF_COLORS), { roughness: 0.85 });
+        [[0, 0.9, 0, 1.3], [-1.1, 0.7, 0.1, 0.95], [1.1, 0.75, -0.1, 1.0]].forEach(([x, y, z, r]) => {
+            const b = new THREE.Mesh(new THREE.SphereGeometry(r, 12, 10), leaf);
+            b.position.set(x, y, z); b.scale.y = 0.85; g.add(b);
+        });
+        for (let i = 0; i < 10; i++) {
+            const a = rnd(0.12, 0.88) * Math.PI;
+            const rose = makeRose(pick(ROSE_COLORS), rnd(0.3, 0.46));
+            rose.position.set(Math.cos(a) * 1.9, 0.45 + Math.sin(a) * 1.35, rnd(0.55, 1.0));
+            rose.rotation.x = rnd(0.25, 0.7);
+            g.add(rose);
+        }
+        return g;
+    }
+    function makeRoseArch() {
+        const g = new THREE.Group();
+        const white = CM(0xfff5f8, { roughness: 0.5 });
+        [-1.9, 1.9].forEach(x => { const p = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.2, 4.6, 8), white); p.position.set(x, 2.3, 0); g.add(p); });
+        const arc = new THREE.Mesh(new THREE.TorusGeometry(1.9, 0.14, 8, 20, Math.PI), white);
+        arc.position.y = 4.6; g.add(arc);
+        const leaf = CM(0x9ddca7);
+        for (let i = 0; i <= 8; i++) { // hojas y rosas sobre el arco
+            const a = (i / 8) * Math.PI;
+            const rose = makeRose(pick(ROSE_COLORS), rnd(0.28, 0.4));
+            rose.position.set(Math.cos(a) * 1.9, 4.6 + Math.sin(a) * 1.9, rnd(0.05, 0.25));
+            rose.rotation.set(0.9, 0, Math.cos(a) * -0.5);
+            g.add(rose);
+            const lf = new THREE.Mesh(new THREE.SphereGeometry(0.2, 6, 6), leaf);
+            lf.scale.set(1.6, 0.4, 0.8); lf.position.set(Math.cos(a) * 1.9 + 0.15, 4.6 + Math.sin(a) * 1.9 - 0.1, 0.1); g.add(lf);
+        }
+        [-1.9, 1.9].forEach(x => { for (let k = 0; k < 4; k++) {
+            const rose = makeRose(pick(ROSE_COLORS), rnd(0.28, 0.4));
+            rose.position.set(x + rnd(-0.15, 0.15), 0.9 + k * 1.0, 0.2); rose.rotation.x = 1.1; g.add(rose);
+        } });
+        return g;
+    }
+    function makeGazebo() {
+        const g = new THREE.Group();
+        const white = CM(0xfff5f8, { roughness: 0.5 });
+        const floor = new THREE.Mesh(new THREE.CylinderGeometry(4, 4.2, 0.4, 20), CM(0xffd6e7)); floor.position.y = 0.2; g.add(floor);
+        for (let i = 0; i < 6; i++) {
+            const a = (i / 6) * Math.PI * 2;
+            const p = new THREE.Mesh(new THREE.CylinderGeometry(0.17, 0.2, 5, 8), white);
+            p.position.set(Math.cos(a) * 3.4, 2.9, Math.sin(a) * 3.4); g.add(p);
+            const r = makeRose(pick(ROSE_COLORS), 0.45); r.position.set(Math.cos(a) * 3.4, 1.0, Math.sin(a) * 3.4 + 0.3); r.rotation.x = 0.6; g.add(r);
+        }
+        const ring = new THREE.Mesh(new THREE.TorusGeometry(3.4, 0.16, 8, 24), white); ring.rotation.x = Math.PI / 2; ring.position.y = 5.4; g.add(ring);
+        const dome = new THREE.Mesh(new THREE.SphereGeometry(3.9, 20, 10, 0, Math.PI * 2, 0, Math.PI * 0.45), CM(0xe9d5ff, { roughness: 0.4, emissive: 0xe9d5ff, emissiveIntensity: 0.15 }));
+        dome.scale.y = 0.85; dome.position.y = 5.4; g.add(dome);
+        const fin = new THREE.Mesh(new THREE.SphereGeometry(0.28, 10, 10), CM(0xffd54f, { metalness: 0.5, roughness: 0.3 })); fin.position.y = 9.1; g.add(fin);
+        for (let k = 0; k < 6; k++) { const r = makeRose(pick(ROSE_COLORS), 0.4); const a = k * 1.05; r.position.set(Math.cos(a) * 2.9, 5.5 + Math.sin(a * 2) * 0.1, Math.sin(a) * 2.9); r.rotation.x = 1.2; g.add(r); }
+        return g;
+    }
+    function makeFountain() {
+        const g = new THREE.Group();
+        const stone = CM(0xffe3ee, { roughness: 0.5 });
+        const basin = new THREE.Mesh(new THREE.CylinderGeometry(3.2, 3.5, 0.9, 24), stone); basin.position.y = 0.45; g.add(basin);
+        const water = new THREE.Mesh(new THREE.CylinderGeometry(2.8, 2.8, 0.12, 24), new THREE.MeshStandardMaterial({ color: 0xc4ecff, transparent: true, opacity: 0.85, roughness: 0.1, emissive: 0x9fdcff, emissiveIntensity: 0.25 }));
+        water.position.y = 0.92; g.add(water);
+        const col = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.5, 2.6, 12), stone); col.position.y = 2.1; g.add(col);
+        const bowl = new THREE.Mesh(new THREE.CylinderGeometry(1.5, 0.8, 0.5, 18), stone); bowl.position.y = 3.3; g.add(bowl);
+        const spray = new THREE.Mesh(new THREE.ConeGeometry(0.5, 1.4, 10), new THREE.MeshBasicMaterial({ color: 0xd8f3ff, transparent: true, opacity: 0.6 })); spray.position.y = 4.3; g.add(spray);
+        for (let i = 0; i < 6; i++) { const a = i * 1.05; const r = makeRose(pick(ROSE_COLORS), 0.4); r.position.set(Math.cos(a) * 3.35, 0.95, Math.sin(a) * 3.35); r.rotation.x = 0.5; g.add(r); }
+        return g;
+    }
+    function makeGiantRose() {
+        const g = new THREE.Group();
+        const h = rnd(7, 12);
+        const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.32, h, 8), CM(0x9ddca7)); stem.position.y = h / 2; g.add(stem);
+        [-1, 1].forEach((s, i) => { const lf = new THREE.Mesh(new THREE.SphereGeometry(1.1, 8, 8), CM(0xb5e6b0)); lf.scale.set(1.8, 0.2, 0.8); lf.position.set(s * 1.3, h * (0.3 + i * 0.2), 0); lf.rotation.z = s * 0.4; g.add(lf); });
+        const rose = makeRose(pick(ROSE_COLORS), rnd(2.8, 4.2)); rose.position.y = h; rose.rotation.x = 0.55; g.add(rose);
+        return g;
+    }
+    let _heartGeo = null;
+    function heartMesh(color) {
+        if (!_heartGeo) {
+            const s = new THREE.Shape();
+            s.moveTo(0, 0.35); s.bezierCurveTo(0, 0.6, -0.5, 0.7, -0.5, 0.3); s.bezierCurveTo(-0.5, -0.05, -0.1, -0.2, 0, -0.5);
+            s.bezierCurveTo(0.1, -0.2, 0.5, -0.05, 0.5, 0.3); s.bezierCurveTo(0.5, 0.7, 0, 0.6, 0, 0.35);
+            _heartGeo = new THREE.ExtrudeGeometry(s, { depth: 0.15, bevelEnabled: false });
+        }
+        const m = new THREE.Mesh(_heartGeo, CM(color, { emissive: color, emissiveIntensity: 0.35, roughness: 0.4 }));
+        const sc = rnd(0.5, 1.1); m.scale.set(sc, sc, sc);
+        return m;
+    }
+    const PETAL_GEO = new THREE.SphereGeometry(0.18, 8, 6);
+
     function addGardenExtras(group, W) {
-        // Campo de flores
-        const palette = [0xff80ab, 0xffffff, 0xfff176, 0xf48fb1, 0xce93d8, 0xff4081];
+        // Prado de florecitas pastel
+        const palette = [0xffc2d9, 0xffffff, 0xfff3b0, 0xf8bbd9, 0xe1c4f7, 0xffd1dc];
         scatterInstanced(group, W, Math.ceil(W * 1.6),
-            new THREE.CylinderGeometry(0.035, 0.035, 0.7, 5), M(0x66bb6a),
+            new THREE.CylinderGeometry(0.035, 0.035, 0.7, 5), CM(0xa5e0a4),
             new THREE.SphereGeometry(0.2, 8, 8), M(0xffffff, { roughness: 0.4 }),
             () => { const s = rnd(0.8, 1.6); return { x: rnd(-15, W + 15), z: rnd(-9.5, -3.5), s, ya: -0.45 + 0.35 * s, yb: -0.45 + 0.75 * s, hs: s }; }, palette);
+        // Rosales llenos de rosas
+        for (let x = -6; x < W + 12; x += rnd(8, 11)) {
+            const bush = makeRoseBush(); const s = rnd(0.9, 1.4);
+            bush.scale.set(s, s, s); bush.position.set(x, -0.4, rnd(-9.5, -5.5));
+            group.add(still(bush));
+        }
+        // Arcos de rosas
+        for (let x = 8; x < W + 10; x += 38) {
+            const arch = makeRoseArch(); const s = rnd(1.2, 1.5);
+            arch.scale.set(s, s, s); arch.position.set(x + rnd(-5, 5), -0.4, rnd(-8, -6));
+            group.add(still(arch));
+        }
+        // Cenadores (glorietas) y fuentes
+        for (let x = 30; x < W + 20; x += 95) {
+            const gz = makeGazebo(); const s = rnd(1.5, 1.9);
+            gz.scale.set(s, s, s); gz.position.set(x, -0.4, rnd(-22, -17));
+            group.add(still(gz));
+        }
+        for (let x = 70; x < W + 20; x += 120) {
+            const f = makeFountain(); const s = rnd(1.3, 1.7);
+            f.scale.set(s, s, s); f.position.set(x, -0.4, rnd(-12, -9));
+            group.add(still(f));
+        }
+        // Rosas gigantes de fondo
+        for (let x = -5; x < W + 20; x += 16) {
+            const gr = makeGiantRose();
+            gr.position.set(x + rnd(-4, 4), -0.6, rnd(-34, -24));
+            group.add(still(gr));
+        }
         // Cercas blancas de jardín
-        const wood = M(0xfff8f0, { roughness: 0.6 });
+        const wood = CM(0xfff8f0, { roughness: 0.6 });
         const pGeo = new THREE.BoxGeometry(0.26, 1.2, 0.1), tGeo = new THREE.ConeGeometry(0.18, 0.28, 4), rGeo = new THREE.BoxGeometry(6.2, 0.12, 0.08);
-        for (let x = -5; x < W + 10; x += 13) {
+        for (let x = -5; x < W + 10; x += 26) {
             const fence = new THREE.Group();
             for (let i = 0; i < 9; i++) {
                 const p = new THREE.Mesh(pGeo, wood); p.position.set(i * 0.72, 0.6, 0); fence.add(p);
                 const t = new THREE.Mesh(tGeo, wood); t.position.set(i * 0.72, 1.33, 0); t.rotation.y = Math.PI / 4; fence.add(t);
             }
             [0.35, 0.85].forEach(y => { const rail = new THREE.Mesh(rGeo, wood); rail.position.set(2.9, y, -0.09); fence.add(rail); });
-            fence.position.set(x, -0.4, -5.5);
+            fence.position.set(x, -0.4, -4.4);
             group.add(still(fence));
         }
-        // Más sakuras en primer plano
-        const pinks = [0xffb7d5, 0xff8fb8, 0xffc9e0, 0xff9ec7];
-        for (let i = 0; i < Math.ceil(W / 10); i++) {
+        // Cerezos en tonos pastel
+        const pinks = [0xffd1e3, 0xffc2d9, 0xffe0ec, 0xf8bbd9];
+        for (let i = 0; i < Math.ceil(W / 14); i++) {
             const tree = Render3D.createSakuraTree(pick(pinks));
             const s = rnd(1.1, 1.7);
             tree.scale.set(s, s, s);
-            tree.position.set(rnd(-10, W + 10), 0.4, rnd(-12, -8));
+            tree.position.set(rnd(-10, W + 10), 0.4, rnd(-16, -11));
             group.add(still(tree));
         }
-        // Arcoíris en el cielo
-        const rb = [0xff5252, 0xff9800, 0xffeb3b, 0x66bb6a, 0x42a5f5, 0xab47bc];
+        // Arcoíris pastel
+        const rb = [0xffb3ba, 0xffdfba, 0xffffba, 0xbaffc9, 0xbae1ff, 0xe3baff];
         for (let x = 20; x < W + 40; x += 140) {
             const arc = new THREE.Group();
             rb.forEach((c, k) => {
-                const band = new THREE.Mesh(new THREE.TorusGeometry(26 - k * 1.1, 0.6, 8, 48, Math.PI), new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: 0.75 }));
+                const band = new THREE.Mesh(new THREE.TorusGeometry(26 - k * 1.1, 0.6, 8, 48, Math.PI), new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: 0.8 }));
                 arc.add(band);
             });
             arc.position.set(x, -4, -62);
             group.add(still(arc));
         }
+        // Corazones y pétalos que suben flotando
+        addRising(group, W, Math.ceil(W / 7), () => heartMesh(pick([0xffc2d9, 0xffb3cf, 0xe9d3ff, 0xffd6e7])), -2, 22, 0.9);
+        addRising(group, W, Math.ceil(W / 3), () => new THREE.Mesh(PETAL_GEO, CM(pick([0xffd1dc, 0xffc2d9, 0xffffff]), { emissive: 0xffc2d9, emissiveIntensity: 0.2 })), -2, 22, 0.6);
     }
 
+    // =========================================================
+    // VALLE DORADO — valles, cañones, minas y rocas
+    // =========================================================
     function makeWindmill() {
         const g = new THREE.Group();
         const tower = new THREE.Mesh(new THREE.CylinderGeometry(1.3, 2.0, 7, 10), M(0xf5deb3, { roughness: 0.9 }));
@@ -2091,24 +2371,176 @@ const Render3D = {
         return g;
     }
 
+    const WOOD = () => CM(0x6d4c41, { roughness: 0.9 });
+    function makeGoldNugget(scale) {
+        const m = new THREE.Mesh(new THREE.OctahedronGeometry(0.16 * (scale || 1)), CM(0xffd700, { metalness: 0.8, roughness: 0.25, emissive: 0xffa000, emissiveIntensity: 0.25 }));
+        m.rotation.set(rnd(0, 3), rnd(0, 3), 0);
+        return m;
+    }
+    function makeMineCart() {
+        const g = new THREE.Group();
+        const body = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.85, 1.05), CM(0x7b4a2d, { roughness: 0.8 })); body.position.y = 0.75; g.add(body);
+        const rim = new THREE.Mesh(new THREE.BoxGeometry(1.85, 0.12, 1.2), CM(0x4e342e, { metalness: 0.4 })); rim.position.y = 1.2; g.add(rim);
+        [[-0.55, -0.5], [0.55, -0.5], [-0.55, 0.5], [0.55, 0.5]].forEach(([x, z]) => {
+            const w = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 0.12, 10), CM(0x37474f, { metalness: 0.6 }));
+            w.rotation.x = Math.PI / 2; w.position.set(x, 0.3, z * 1.05); g.add(w);
+        });
+        for (let i = 0; i < 7; i++) { const n = makeGoldNugget(rnd(1, 1.8)); n.position.set(rnd(-0.6, 0.6), 1.25 + rnd(0, 0.18), rnd(-0.3, 0.3)); g.add(n); }
+        return g;
+    }
+    function makeMineEntrance() {
+        const g = new THREE.Group();
+        const rock = CM(0x9c6b3c, { roughness: 0.95 });
+        const mound = new THREE.Mesh(new THREE.SphereGeometry(5, 14, 10, 0, Math.PI * 2, 0, Math.PI / 2), rock);
+        mound.scale.set(1.55, 1.0, 0.8); g.add(mound);
+        for (let i = 0; i < 7; i++) { // rocas sueltas sobre la montaña
+            const r = new THREE.Mesh(new THREE.DodecahedronGeometry(rnd(0.6, 1.3)), CM(pick([0xb07a45, 0x8a5a30, 0xc48a50]), { roughness: 0.95 }));
+            r.position.set(rnd(-6, 6), rnd(0.5, 3.8), rnd(-1, 2.5)); r.rotation.set(rnd(0, 3), rnd(0, 3), 0); g.add(r);
+        }
+        const hole = new THREE.Mesh(new THREE.BoxGeometry(2.6, 3.0, 0.6), new THREE.MeshBasicMaterial({ color: 0x120a04 }));
+        hole.position.set(0, 1.5, 3.55); g.add(hole);
+        [-1.5, 1.5].forEach(x => { const p = new THREE.Mesh(new THREE.BoxGeometry(0.34, 3.4, 0.34), WOOD()); p.position.set(x, 1.7, 3.85); g.add(p); });
+        const top = new THREE.Mesh(new THREE.BoxGeometry(3.8, 0.4, 0.45), WOOD()); top.position.set(0, 3.45, 3.85); g.add(top);
+        [-1, 1].forEach(s => { const br = new THREE.Mesh(new THREE.BoxGeometry(0.2, 1.1, 0.2), WOOD()); br.position.set(s * 1.2, 3.0, 3.85); br.rotation.z = s * 0.7; g.add(br); });
+        const lampCap = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.14, 0.2, 6), CM(0x37474f)); lampCap.position.set(0, 3.0, 4.15); g.add(lampCap);
+        const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.2, 10, 10), new THREE.MeshBasicMaterial({ color: 0xffe082 })); lamp.position.set(0, 2.75, 4.15); g.add(lamp);
+        const glow = new THREE.Mesh(new THREE.SphereGeometry(0.5, 10, 10), new THREE.MeshBasicMaterial({ color: 0xffd54f, transparent: true, opacity: 0.25 })); glow.position.copy(lamp.position); g.add(glow);
+        // vías por delante de la entrada y vagoneta con oro
+        const railMat = CM(0x5d4037, { metalness: 0.6, roughness: 0.5 });
+        [5.6, 6.6].forEach(z => { const r = new THREE.Mesh(new THREE.BoxGeometry(11, 0.1, 0.1), railMat); r.position.set(0, 0.12, z); g.add(r); });
+        for (let i = 0; i < 13; i++) { const t = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.07, 1.4), WOOD()); t.position.set(-5.4 + i * 0.9, 0.06, 6.1); g.add(t); }
+        const cart = makeMineCart(); cart.position.set(rnd(-2.5, 2.5), 0.1, 6.1); g.add(cart);
+        const pile = new THREE.Group(); for (let i = 0; i < 8; i++) { const n = makeGoldNugget(rnd(1.2, 2)); n.position.set(rnd(-0.6, 0.6), 0.15 + rnd(0, 0.15), rnd(-0.4, 0.4)); pile.add(n); }
+        pile.position.set(4.2, 0, 4.8); g.add(pile);
+        return g;
+    }
+    function makeHeadframe() {
+        const g = new THREE.Group();
+        const wood = WOOD();
+        const apex = new THREE.Vector3(0, 12, 0);
+        [[-2.4, -1.8], [2.4, -1.8], [-2.4, 1.8], [2.4, 1.8]].forEach(([x, z]) => g.add(beam(new THREE.Vector3(x, 0, z), apex.clone().add(new THREE.Vector3(0, 0, 0)), 0.22, wood)));
+        [3, 6, 9].forEach(y => { const k = 1 - y / 12; [[-1, 0], [1, 0]].forEach(([s]) => g.add(beam(new THREE.Vector3(-2.4 * k * 1, y, 1.8 * k), new THREE.Vector3(2.4 * k, y, 1.8 * k), 0.12, wood))); });
+        const wheel = new THREE.Group();
+        wheel.name = 'wheel';
+        wheel.add(new THREE.Mesh(new THREE.TorusGeometry(1.7, 0.16, 8, 24), CM(0x37474f, { metalness: 0.6, roughness: 0.4 })));
+        for (let k = 0; k < 6; k++) { const sp = new THREE.Mesh(new THREE.BoxGeometry(0.12, 3.4, 0.1), CM(0x455a64, { metalness: 0.5 })); sp.rotation.z = k * Math.PI / 6; wheel.add(sp); }
+        wheel.add(new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 0.3, 10), CM(0xffd54f, { metalness: 0.6 })));
+        wheel.rotation.x = 0; wheel.position.set(0, 11.2, 2.4);
+        g.add(wheel);
+        g.userData.spinners = [{ o: wheel, axis: 'z', speed: 0.8 }];
+        g.add(beam(new THREE.Vector3(0, 9.5, 2.4), new THREE.Vector3(0.6, 1.2, 2.4), 0.05, CM(0x3e2723)));
+        const hut = new THREE.Mesh(new THREE.BoxGeometry(4.6, 3.0, 3.4), CM(0xb07a45, { roughness: 0.9 })); hut.position.set(5, 1.5, 0); g.add(hut);
+        const hutRoof = new THREE.Mesh(new THREE.ConeGeometry(3.6, 1.8, 4), CM(0x6d4c41)); hutRoof.rotation.y = Math.PI / 4; hutRoof.position.set(5, 3.9, 0); g.add(hutRoof);
+        const hutWin = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.9, 0.1), new THREE.MeshBasicMaterial({ color: 0xffe082 })); hutWin.position.set(5, 1.8, 1.75); g.add(hutWin);
+        return g;
+    }
+    function makeCliff(w, h) {
+        const g = new THREE.Group();
+        const cols = [0xe29a3c, 0xc9782a, 0xf0b25a, 0xb86a25, 0xdb8f35, 0xa85f20];
+        const layers = Math.max(4, Math.round(h / 3.4));
+        let y = 0;
+        for (let i = 0; i < layers; i++) {
+            const lh = rnd(2.6, 4), lw = w * (1 - i * rnd(0.04, 0.09)) * rnd(0.92, 1.05);
+            const b = new THREE.Mesh(new THREE.BoxGeometry(lw, lh, rnd(6, 9)), CM(cols[i % cols.length], { roughness: 0.95 }));
+            b.position.set(rnd(-1.5, 1.5), y + lh / 2, 0); g.add(b);
+            y += lh;
+        }
+        for (let i = 0; i < 4; i++) { // picos de roca arriba
+            const sp = new THREE.Mesh(new THREE.ConeGeometry(rnd(1, 2.4), rnd(3, 7), 6), CM(pick([0xd98a2b, 0xbf6f1e]), { roughness: 0.95 }));
+            sp.position.set(rnd(-w / 3, w / 3), y + 1.5, rnd(-1, 1)); g.add(sp);
+        }
+        return g;
+    }
+    function makeOreRock() {
+        const g = new THREE.Group();
+        [[0, 0.7, 0, 1.2], [1.3, 0.4, 0.3, 0.7], [-1.1, 0.45, -0.2, 0.8]].forEach(([x, y, z, r]) => {
+            const rk = new THREE.Mesh(new THREE.DodecahedronGeometry(r), CM(pick([0x8d6e63, 0x795548, 0x9e7b5a]), { roughness: 0.95 }));
+            rk.position.set(x, y, z); rk.rotation.set(rnd(0, 3), rnd(0, 3), 0); g.add(rk);
+            for (let i = 0; i < 4; i++) { const n = makeGoldNugget(1.1); n.position.set(x + rnd(-r, r) * 0.7, y + rnd(0, r) * 0.8, z + r * 0.75); g.add(n); }
+        });
+        return g;
+    }
+    function makeCrystalCluster(color) {
+        const g = new THREE.Group();
+        const mat = new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.55, transparent: true, opacity: 0.88, roughness: 0.15, metalness: 0.2 });
+        for (let i = 0; i < 6; i++) {
+            const h = rnd(1.2, 3.2);
+            const c = new THREE.Mesh(new THREE.ConeGeometry(rnd(0.28, 0.5), h, 6), mat);
+            c.position.set(rnd(-1, 1), h / 2, rnd(-0.5, 0.5)); c.rotation.z = rnd(-0.4, 0.4); g.add(c);
+        }
+        return g;
+    }
+    function makeCactus() {
+        const g = new THREE.Group();
+        const mat = CM(0x7cb342, { roughness: 0.8 });
+        const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.4, 3.2, 10), mat); trunk.position.y = 1.6; g.add(trunk);
+        const top = new THREE.Mesh(new THREE.SphereGeometry(0.35, 10, 8), mat); top.position.y = 3.2; g.add(top);
+        [[-1, 1.6], [1, 2.1]].forEach(([s, y]) => {
+            const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 1.2, 8), mat); arm.position.set(s * 0.8, y + 0.5, 0); g.add(arm);
+            const el = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 0.8, 8), mat); el.rotation.z = Math.PI / 2; el.position.set(s * 0.45, y, 0); g.add(el);
+        });
+        return g;
+    }
+
     function addGoldenExtras(group, W) {
-        // Campos de trigo
-        scatterInstanced(group, W, Math.ceil(W * 2.6),
+        // Valles: capas de colinas doradas que se pierden en la distancia
+        const layers = [[-96, 0xf4dca4, 34, 0.38], [-82, 0xedc271, 30, 0.45], [-68, 0xdea044, 27, 0.5], [-54, 0xc4812a, 24, 0.55]];
+        layers.forEach(([z, color, r, sy], li) => {
+            const mat = new THREE.MeshStandardMaterial({ color, roughness: 1 });
+            for (let x = -40 + li * 9; x < W + 60; x += r * 1.35) {
+                const hill = new THREE.Mesh(new THREE.SphereGeometry(r * rnd(0.8, 1.2), 18, 10), mat);
+                hill.scale.set(1.3, sy * rnd(0.8, 1.2), 0.9);
+                hill.position.set(x + rnd(-6, 6), -r * sy * 0.55 - 2, z);
+                group.add(still(hill));
+            }
+        });
+        // Cañones con vetas de roca
+        for (let x = -20; x < W + 50; x += 52) {
+            const cliff = makeCliff(rnd(22, 34), rnd(14, 24));
+            cliff.position.set(x + rnd(-8, 8), -2, rnd(-44, -36));
+            group.add(still(cliff));
+        }
+        // Campos de trigo en el valle
+        scatterInstanced(group, W, Math.ceil(W * 1.5),
             new THREE.CylinderGeometry(0.025, 0.035, 1.3, 5), M(0xd4a017),
             new THREE.SphereGeometry(0.1, 6, 6), M(0xffca28),
             () => { const s = rnd(0.8, 1.5); return { x: rnd(-15, W + 15), z: rnd(-9, -3.5), s, ya: -0.45 + 0.65 * s, yb: -0.45 + 1.32 * s, hs: 1.3, tilt: rnd(-0.12, 0.12) }; },
             [0xffca28, 0xffd54f, 0xffb300]);
-        // Molinos de viento (las aspas giran)
-        for (let x = 10; x < W + 20; x += 42) {
-            const mill = makeWindmill();
-            const s = rnd(1.4, 1.9);
-            mill.scale.set(s, s, s);
-            mill.position.set(x + rnd(-6, 6), -0.5, rnd(-24, -17));
+        // Minas con vagoneta, vías y montoncitos de oro
+        for (let x = 6; x < W + 20; x += rnd(40, 52)) {
+            const mine = makeMineEntrance(); const s = rnd(1.1, 1.5);
+            mine.scale.set(s, s, s);
+            mine.position.set(x, -0.5, rnd(-17, -13));
+            group.add(still(mine));
+        }
+        // Torres de extracción con rueda que gira
+        for (let x = 34; x < W + 30; x += 88) {
+            const hf = makeHeadframe(); const s = rnd(1.3, 1.7);
+            hf.scale.set(s, s, s);
+            hf.position.set(x + rnd(-6, 6), -0.5, rnd(-26, -21));
+            group.add(hf);
+        }
+        // Rocas con pepitas de oro, cristales ámbar y cactus
+        for (let x = -4; x < W + 12; x += rnd(11, 15)) {
+            const ore = makeOreRock(); const s = rnd(0.9, 1.5);
+            ore.scale.set(s, s, s); ore.position.set(x, -0.4, rnd(-10, -5.5)); group.add(still(ore));
+        }
+        for (let x = 6; x < W + 12; x += rnd(18, 26)) {
+            const cr = makeCrystalCluster(pick([0xffa000, 0xffb300, 0xff8f00])); const s = rnd(0.9, 1.5);
+            cr.scale.set(s, s, s); cr.position.set(x, -0.4, rnd(-10, -6)); group.add(still(cr));
+        }
+        for (let x = 2; x < W + 12; x += rnd(24, 34)) {
+            const ca = makeCactus(); const s = rnd(0.9, 1.4);
+            ca.scale.set(s, s, s); ca.position.set(x, -0.4, rnd(-9, -5)); group.add(still(ca));
+        }
+        // Molinos y heno del valle (menos que antes: ahora mandan las minas)
+        for (let x = 20; x < W + 20; x += 115) {
+            const mill = makeWindmill(); const s = rnd(1.4, 1.9);
+            mill.scale.set(s, s, s); mill.position.set(x + rnd(-6, 6), -0.5, rnd(-34, -28));
             group.add(mill);
         }
-        // Pacas de heno
         const hayMat = M(0xe6b800, { roughness: 0.95 }), bandMat = M(0x8d6e00);
-        for (let x = 0; x < W + 10; x += 17) {
+        for (let x = 0; x < W + 10; x += 34) {
             const hay = new THREE.Group();
             const body = new THREE.Mesh(new THREE.CylinderGeometry(0.9, 0.9, 1.2, 14), hayMat);
             body.rotation.z = Math.PI / 2; hay.add(body);
@@ -2116,9 +2548,8 @@ const Render3D = {
             hay.position.set(x + rnd(-4, 4), 0.4, rnd(-7, -4.5));
             group.add(still(hay));
         }
-        // Árboles de otoño dorado
         const autumn = [0xffb300, 0xff8f00, 0xffca28, 0xf57c00];
-        for (let i = 0; i < Math.ceil(W / 13); i++) {
+        for (let i = 0; i < Math.ceil(W / 28); i++) {
             const t = new THREE.Group();
             const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.4, 3, 8), M(0x6d4c41)); trunk.position.y = 1.5; t.add(trunk);
             [[0, 3.6, 0, 1.6], [-1, 3.0, 0.3, 1.1], [1, 3.1, -0.3, 1.2]].forEach(([x, y, z, rad]) => {
@@ -2130,63 +2561,152 @@ const Render3D = {
             t.position.set(rnd(-10, W + 10), -0.4, rnd(-14, -10));
             group.add(still(t));
         }
-        // Mesetas de roca al fondo
-        for (let x = -10; x < W + 40; x += 48) {
-            const mesa = new THREE.Group();
-            [[0, 14, 7, 9], [0.5, 9, 9, 11]].forEach(([dx, h, rt, rb2], k) => {
-                const tier = new THREE.Mesh(new THREE.CylinderGeometry(rt, rb2, h, 14), M(k === 0 ? 0xd98a2b : 0xbf6f1e, { roughness: 0.95 }));
-                tier.position.set(dx, k === 0 ? h / 2 + 8 : h / 2, 0); mesa.add(tier);
-            });
-            mesa.position.set(x + rnd(-8, 8), -4, rnd(-48, -40));
-            group.add(still(mesa));
-        }
         // Rayos de sol girando detrás del sol
         const rays = new THREE.Group();
         for (let k = 0; k < 12; k++) {
             const ray = new THREE.Mesh(new THREE.BoxGeometry(2.2, 46, 0.1), new THREE.MeshBasicMaterial({ color: 0xfff3c4, transparent: true, opacity: 0.16 }));
             ray.position.y = 23; const holder = new THREE.Group(); holder.rotation.z = k * Math.PI / 6; holder.add(ray); rays.add(holder);
         }
-        rays.position.set(W * 0.5, 14, -58);
+        rays.position.set(W * 0.5, 14, -100);
         rays.userData.isSunRays = true;
         group.add(rays);
+        // Chispitas de oro que suben con el calor
+        addRising(group, W, Math.ceil(W / 6), () => new THREE.Mesh(new THREE.OctahedronGeometry(0.14), CM(0xffd700, { metalness: 0.7, roughness: 0.3, emissive: 0xffa000, emissiveIntensity: 0.5 })), -2, 20, 0.7);
     }
 
-    function makeCastle() {
+    // =========================================================
+    // CASTILLO DULCE — un castillo hecho de golosinas
+    // =========================================================
+    const CANDY = { pink: 0xffc2dc, hot: 0xff6fa5, white: 0xfff5fa, mint: 0xb8f0d8, lilac: 0xd9c2ff, peach: 0xffd9b8, choc: 0x6d3b2a, lemon: 0xfff2a8, sky: 0xb3e5fc };
+    const SPRINKLES = [0xff6fa5, 0x80deea, 0xfff176, 0xb388ff, 0x69f0ae, 0xffffff];
+    function stripedTower(h, r, c1, c2) { // torre de caramelo con rayas
         const g = new THREE.Group();
-        const stone = M(0xb39ddb, { roughness: 0.8 });
-        const winMat = new THREE.MeshBasicMaterial({ color: 0xffe082 });
-        const roofCols = [0xf06292, 0xba68c8, 0x7e57c2];
-        const keep = new THREE.Mesh(new THREE.BoxGeometry(12, 10, 6), stone); keep.position.y = 5; g.add(keep);
-        for (let i = 0; i < 7; i++) { const m = new THREE.Mesh(new THREE.BoxGeometry(1, 1.2, 1), stone); m.position.set(-5.5 + i * 1.83, 10.6, 2.5); g.add(m); }
-        [[-8, 14], [8, 14], [-3.5, 19], [3.5, 17]].forEach(([x, h], i) => {
-            const t = new THREE.Mesh(new THREE.CylinderGeometry(1.8, 2.1, h, 12), stone); t.position.set(x, h / 2, 0); g.add(t);
-            const roof = new THREE.Mesh(new THREE.ConeGeometry(2.4, 4.5, 12), M(roofCols[i % 3])); roof.position.set(x, h + 2.2, 0); g.add(roof);
-            const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 1.6, 5), M(0xffd54f)); pole.position.set(x, h + 5.3, 0); g.add(pole);
-            const flag = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.6, 0.05), M(0xff4081)); flag.position.set(x + 0.6, h + 5.7, 0); g.add(flag);
-            const w = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1.1, 0.1), winMat); w.position.set(x, h * 0.62, 1.85); g.add(w);
+        const n = Math.max(4, Math.round(h / 1.4));
+        for (let i = 0; i < n; i++) {
+            const seg = new THREE.Mesh(new THREE.CylinderGeometry(r, r * 1.03, h / n, 14), CM(i % 2 ? c1 : c2, { roughness: 0.35 }));
+            seg.position.y = (i + 0.5) * (h / n); g.add(seg);
+        }
+        return g;
+    }
+    function scoopRoof(r, color) { // techo de bola de helado con chispas y cereza
+        const g = new THREE.Group();
+        const dome = new THREE.Mesh(new THREE.SphereGeometry(r, 16, 10, 0, Math.PI * 2, 0, Math.PI / 2), CM(color, { roughness: 0.3 })); g.add(dome);
+        const rim = new THREE.Mesh(new THREE.TorusGeometry(r * 0.98, r * 0.16, 8, 20), CM(CANDY.white, { roughness: 0.3 })); rim.rotation.x = Math.PI / 2; g.add(rim);
+        for (let i = 0; i < 14; i++) {
+            const a = rnd(0, 6.28), t = rnd(0.15, 1.3);
+            const sp = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.07, 0.07), CM(pick(SPRINKLES)));
+            sp.position.set(Math.cos(a) * Math.cos(t) * r * 1.01, Math.sin(t) * r * 1.01, Math.sin(a) * Math.cos(t) * r * 1.01);
+            sp.rotation.set(rnd(0, 3), rnd(0, 3), rnd(0, 3)); g.add(sp);
+        }
+        const cherry = new THREE.Mesh(new THREE.SphereGeometry(r * 0.2, 10, 10), CM(0xff1744, { roughness: 0.2 })); cherry.position.y = r + r * 0.12; g.add(cherry);
+        return g;
+    }
+    function coneRoof(r, h, color) { // techo de cucurucho con crema en espiral
+        const g = new THREE.Group();
+        const cone = new THREE.Mesh(new THREE.ConeGeometry(r, h, 14), CM(color, { roughness: 0.35 })); cone.position.y = h / 2; g.add(cone);
+        for (let i = 0; i < 4; i++) {
+            const k = 1 - (i + 0.5) / 4.4;
+            const ring = new THREE.Mesh(new THREE.TorusGeometry(r * k, 0.14, 8, 18), CM(CANDY.white, { roughness: 0.3 }));
+            ring.rotation.x = Math.PI / 2; ring.position.y = h * (i + 0.5) / 4.4; g.add(ring);
+        }
+        const star = new THREE.Mesh(new THREE.OctahedronGeometry(r * 0.3), CM(0xfff176, { emissive: 0xfff176, emissiveIntensity: 0.6 })); star.position.y = h + r * 0.25; g.add(star);
+        return g;
+    }
+    function lollipopFlag(h) {
+        const g = new THREE.Group();
+        const stick = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, h, 6), CM(CANDY.white)); stick.position.y = h / 2; g.add(stick);
+        const swirl = new THREE.Group();
+        [[0.42, CANDY.hot], [0.3, CANDY.white], [0.18, CANDY.hot]].forEach(([rad, c], i) => {
+            const d = new THREE.Mesh(new THREE.CylinderGeometry(rad, rad, 0.1, 16), CM(c)); d.rotation.x = Math.PI / 2; d.position.z = i * 0.02; swirl.add(d);
         });
-        [-3.5, 0, 3.5].forEach(x => { const w = new THREE.Mesh(new THREE.BoxGeometry(0.9, 1.5, 0.1), winMat); w.position.set(x, 6.5, 3.05); g.add(w); });
-        const door = new THREE.Mesh(new THREE.BoxGeometry(2.2, 3.2, 0.1), M(0x4a148c)); door.position.set(0, 1.6, 3.05); g.add(door);
+        swirl.position.y = h + 0.3; g.add(swirl);
+        const pennant = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.5, 0.04), CM(pick([CANDY.lilac, CANDY.mint, CANDY.lemon]))); pennant.position.set(0.5, h - 0.4, 0); g.add(pennant);
+        return g;
+    }
+    function makeCandyCastle() {
+        const g = new THREE.Group();
+        const icing = CM(CANDY.white, { roughness: 0.3 });
+        // Cuerpo principal de glaseado rosa con vetas de azúcar
+        const keep = new THREE.Mesh(new THREE.BoxGeometry(12, 10, 6), CM(pick([CANDY.pink, CANDY.peach]), { roughness: 0.4 })); keep.position.y = 5; g.add(keep);
+        for (let i = 1; i < 4; i++) { const line = new THREE.Mesh(new THREE.BoxGeometry(12.05, 0.14, 6.05), icing); line.position.y = i * 2.5; g.add(line); }
+        // Chorreado de azúcar blanco en el borde del techo
+        const slab = new THREE.Mesh(new THREE.BoxGeometry(12.4, 0.6, 6.4), icing); slab.position.y = 10.2; g.add(slab);
+        for (let i = 0; i < 9; i++) { const d = new THREE.Mesh(new THREE.SphereGeometry(0.34, 8, 8), icing); d.scale.set(1, rnd(1.6, 3.2), 1); d.position.set(-5.4 + i * 1.35, 9.7 - rnd(0, 0.5), 3.15); g.add(d); }
+        // Almenas de gominolas
+        for (let i = 0; i < 8; i++) { const gd = new THREE.Mesh(new THREE.SphereGeometry(0.6, 10, 8, 0, Math.PI * 2, 0, Math.PI / 2), CM(pick([CANDY.hot, CANDY.mint, CANDY.lemon, CANDY.lilac, CANDY.sky]), { roughness: 0.25 })); gd.position.set(-5.2 + i * 1.5, 10.5, 2.6); g.add(gd); }
+        // Torres rayadas de caramelo con techos de helado
+        [[-8, 15, 0], [8, 15, 1], [-3.8, 20, 2], [3.8, 18, 0]].forEach(([x, h, k]) => {
+            const tw = stripedTower(h, 1.8, CANDY.hot, CANDY.white); tw.position.set(x, 0, 0); g.add(tw);
+            const ring = new THREE.Mesh(new THREE.TorusGeometry(2.0, 0.28, 8, 20), icing); ring.rotation.x = Math.PI / 2; ring.position.set(x, h, 0); g.add(ring);
+            const roof = k === 1 ? scoopRoof(2.2, CANDY.mint) : k === 2 ? coneRoof(2.3, 4.6, CANDY.lilac) : coneRoof(2.3, 4.2, CANDY.peach);
+            roof.position.set(x, h + 0.1, 0); g.add(roof);
+            const flag = lollipopFlag(2.2); flag.position.set(x, h + (k === 1 ? 2.7 : 4.8), 0); g.add(flag);
+            const win = new THREE.Mesh(new THREE.BoxGeometry(0.7, 1.2, 0.12), new THREE.MeshBasicMaterial({ color: pick([0xffe082, 0xff9ec7, 0x9be7ff]) })); win.position.set(x, h * 0.6, 1.85); g.add(win);
+        });
+        // Ventanas de gelatina
+        [-4, 0, 4].forEach((x, i) => {
+            const fr = new THREE.Mesh(new THREE.BoxGeometry(1.2, 1.9, 0.1), icing); fr.position.set(x, 6.6, 3.02); g.add(fr);
+            const w = new THREE.Mesh(new THREE.BoxGeometry(0.9, 1.6, 0.12), new THREE.MeshBasicMaterial({ color: [0xffe082, 0xff8fb8, 0x80deea][i] })); w.position.set(x, 6.6, 3.06); g.add(w);
+        });
+        // Puerta de barra de chocolate con pilares de bastón de caramelo
+        const door = new THREE.Mesh(new THREE.BoxGeometry(2.4, 3.6, 0.16), CM(CANDY.choc, { roughness: 0.5 })); door.position.set(0, 1.8, 3.08); g.add(door);
+        const lineMat = CM(0x8d5a3b);
+        [-0.4, 0.4].forEach(x => { const l = new THREE.Mesh(new THREE.BoxGeometry(0.06, 3.5, 0.05), lineMat); l.position.set(x, 1.8, 3.18); g.add(l); });
+        [0.9, 1.8, 2.7].forEach(y => { const l = new THREE.Mesh(new THREE.BoxGeometry(2.3, 0.06, 0.05), lineMat); l.position.set(0, y, 3.18); g.add(l); });
+        [-1.65, 1.65].forEach(x => { const c = stripedTower(3.8, 0.28, CANDY.hot, CANDY.white); c.position.set(x, 0, 3.2); g.add(c); });
+        const arch = new THREE.Mesh(new THREE.TorusGeometry(1.65, 0.24, 8, 18, Math.PI), CM(CANDY.hot, { roughness: 0.3 })); arch.position.set(0, 3.8, 3.2); g.add(arch);
+        const heart = heartMesh(0xff6fa5); heart.scale.set(1.6, 1.6, 1.6); heart.position.set(0, 7.9, 3.1); g.add(heart);
+        // Oblea de entrada
+        const bridge = new THREE.Mesh(new THREE.BoxGeometry(3, 0.2, 4), CM(0xe9b872, { roughness: 0.8 })); bridge.position.set(0, 0.1, 5.2); g.add(bridge);
+        return g;
+    }
+    function makeIceCreamTree() {
+        const g = new THREE.Group();
+        const cone = new THREE.Mesh(new THREE.ConeGeometry(1.1, 3.4, 12), CM(0xe9b872, { roughness: 0.8 })); cone.rotation.x = Math.PI; cone.position.y = 1.7; g.add(cone);
+        [[0, 3.9, 1.5, pick([CANDY.pink, CANDY.mint])], [0, 5.6, 1.2, pick([CANDY.lilac, CANDY.lemon])]].forEach(([x, y, r, c]) => { const s = new THREE.Mesh(new THREE.SphereGeometry(r, 14, 12), CM(c, { roughness: 0.3 })); s.position.set(x, y, 0); g.add(s); });
+        const cherry = new THREE.Mesh(new THREE.SphereGeometry(0.3, 10, 10), CM(0xff1744, { roughness: 0.2 })); cherry.position.y = 7.0; g.add(cherry);
+        return g;
+    }
+    function makeDonut() {
+        const g = new THREE.Group();
+        const dough = new THREE.Mesh(new THREE.TorusGeometry(2, 0.95, 12, 24), CM(0xe8b370, { roughness: 0.8 })); g.add(dough);
+        const glaze = new THREE.Mesh(new THREE.TorusGeometry(2, 1.0, 12, 24, Math.PI * 2), CM(pick([CANDY.hot, CANDY.pink, CANDY.mint, CANDY.lilac]), { roughness: 0.25 })); glaze.scale.set(1, 1, 0.55); glaze.position.z = 0.35; g.add(glaze);
+        for (let i = 0; i < 12; i++) { const a = rnd(0, 6.28), rr = 2 + rnd(-0.5, 0.5); const sp = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.08, 0.08), CM(pick(SPRINKLES))); sp.position.set(Math.cos(a) * rr, Math.sin(a) * rr, 0.85); sp.rotation.z = rnd(0, 3); g.add(sp); }
+        g.rotation.x = -0.35;
         return g;
     }
 
     function addCastleExtras(group, W) {
-        // Castillos lejanos con ventanas encendidas
-        for (let x = 0; x < W + 50; x += 75) {
-            const c = makeCastle();
+        // Castillos de golosina con ventanas encendidas
+        for (let x = 0; x < W + 60; x += 70) {
+            const c = makeCandyCastle();
             const s = rnd(1.5, 2.1);
             c.scale.set(s, s, s);
-            c.position.set(x + rnd(-10, 10), -6, rnd(-62, -50));
+            c.position.set(x + rnd(-10, 10), -6, rnd(-64, -52));
             group.add(still(c));
         }
-        // Golosinas gigantes en primer plano
+        // Colinas de merengue al fondo
+        const meringue = [0x6a3a9a, 0x7e4aa8];
+        for (let x = -20; x < W + 60; x += 34) {
+            const h = new THREE.Mesh(new THREE.SphereGeometry(rnd(14, 20), 14, 10), CM(pick(meringue), { roughness: 0.9 }));
+            h.scale.set(1.5, 0.5, 1); h.position.set(x + rnd(-6, 6), -9, rnd(-40, -32)); group.add(still(h));
+        }
+        // Golosinas gigantes en primer plano, helados y donas
         const types = ['candycane', 'lollipop', 'gumdrop', 'cupcake', 'candycane', 'lollipop'];
-        for (let i = 0; i < Math.ceil(W / 9); i++) {
+        for (let i = 0; i < Math.ceil(W / 10); i++) {
             const prop = Render3D.createProp(pick(types));
             const s = rnd(2.6, 4.6);
             prop.scale.set(s, s, s);
             prop.position.set(rnd(-12, W + 12), -0.4, rnd(-14, -8));
             group.add(still(prop));
+        }
+        for (let x = 4; x < W + 10; x += rnd(26, 34)) {
+            const t = makeIceCreamTree(); const s = rnd(1.3, 1.9);
+            t.scale.set(s, s, s); t.position.set(x, -0.4, rnd(-22, -15)); group.add(still(t));
+        }
+        for (let x = 14; x < W + 10; x += rnd(40, 55)) {
+            const d = makeDonut(); const s = rnd(1.1, 1.6);
+            d.scale.set(s, s, s); d.position.set(x, 1.5, rnd(-20, -13)); group.add(still(d));
         }
         // Nubes de algodón de azúcar
         const cotton = [0xffc1e3, 0xb3e5fc, 0xe1bee7, 0xf8bbd0];
@@ -2199,6 +2719,9 @@ const Render3D = {
             cloud.position.set(rnd(-10, W + 20), rnd(14, 26), rnd(-42, -28));
             group.add(still(cloud));
         }
+        // Chispas de colores que suben flotando
+        const sprGeo = new THREE.BoxGeometry(0.3, 0.08, 0.08);
+        addRising(group, W, Math.ceil(W / 3.5), () => { const m = new THREE.Mesh(sprGeo, CM(pick(SPRINKLES), { emissive: 0xffffff, emissiveIntensity: 0.15 })); m.rotation.set(rnd(0, 3), rnd(0, 3), rnd(0, 3)); return m; }, -2, 24, 0.7);
     }
 
     // ---------- OBJETOS NUEVOS DE JUEGO ----------
@@ -2250,4 +2773,18 @@ const Render3D = {
         g.add(rim, plate, gem);
         return g;
     };
+
+    // Adornos de plataforma nuevos: rosas (Jardín), minerales (Valle), helados (Castillo)
+    const _prevTheme = Render3D.createThemeProp;
+    const NEW_PROPS = {
+        rose: () => { const g = new THREE.Group(); const st = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.05, 0.55, 6), CM(0x9ddca7)); st.position.y = 0.27; g.add(st); const rs = makeRose(pick(ROSE_COLORS), 0.34); rs.position.y = 0.55; rs.rotation.x = 0.25; g.add(rs); return g; },
+        rosebush: () => { const g = makeRoseBush(); g.scale.set(0.36, 0.36, 0.36); return g; },
+        oreRock: () => { const g = makeOreRock(); g.scale.set(0.5, 0.5, 0.5); return g; },
+        crystal: () => { const g = makeCrystalCluster(pick([0xffa000, 0xffb300])); g.scale.set(0.5, 0.5, 0.5); return g; },
+        cactus: () => { const g = makeCactus(); g.scale.set(0.38, 0.38, 0.38); return g; },
+        minecart: () => { const g = makeMineCart(); g.scale.set(0.6, 0.6, 0.6); return g; },
+        icecream: () => { const g = makeIceCreamTree(); g.scale.set(0.2, 0.2, 0.2); return g; },
+        donut: () => { const g = makeDonut(); g.scale.set(0.24, 0.24, 0.24); g.position.y = 0.3; const w = new THREE.Group(); w.add(g); return w; }
+    };
+    Render3D.createThemeProp = (type) => NEW_PROPS[type] ? NEW_PROPS[type]() : _prevTheme(type);
 })();
